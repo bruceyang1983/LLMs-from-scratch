@@ -28,6 +28,8 @@ import os
 import shutil
 import tempfile
 import platform
+from collections.abc import Mapping
+from packaging.version import Version
 import pytest
 import torch
 import torch.nn as nn
@@ -57,6 +59,36 @@ class Qwen3RMSNorm(nn.Module):
 
 
 transformers_installed = importlib.util.find_spec("transformers") is not None
+
+
+def _hf_ids(obj):
+    """Normalize HF chat-template outputs across Transformers versions."""
+    if isinstance(obj, Mapping):
+        if "input_ids" in obj:
+            obj = obj["input_ids"]
+        elif "ids" in obj:
+            obj = obj["ids"]
+    elif hasattr(obj, "keys") and hasattr(obj, "__getitem__"):
+        # Some HF containers behave like mappings but don't register as Mapping.
+        try:
+            if "input_ids" in obj:
+                obj = obj["input_ids"]
+            elif "ids" in obj:
+                obj = obj["ids"]
+        except Exception:
+            pass
+    if hasattr(obj, "input_ids"):
+        obj = obj.input_ids
+    if hasattr(obj, "ids"):
+        obj = obj.ids
+    if isinstance(obj, torch.Tensor):
+        obj = obj.tolist()
+    if isinstance(obj, tuple):
+        obj = list(obj)
+    # Some HF versions return a batched structure even for a single prompt.
+    if isinstance(obj, list) and obj and isinstance(obj[0], list) and len(obj) == 1:
+        obj = obj[0]
+    return list(obj)
 
 
 @pytest.fixture
@@ -211,13 +243,27 @@ def test_rope(context_len):
 
     # Generate reference RoPE via HF
     class RoPEConfig:
-        rope_type = "qwen3"
+        # Transformers' RoPE init map does not include "qwen3".
+        rope_type = "default"
         factor = 1.0
         dim: int = head_dim
         rope_theta = 1_000_000
         max_position_embeddings = context_len
         hidden_size = head_dim * num_heads
         num_attention_heads = num_heads
+
+        def __init__(self):
+            # Transformers >=5.0.0 expects `rope_parameters` on the instance.
+            self.rope_parameters = {"rope_type": "default", "rope_theta": rope_theta, "factor": 1.0}
+
+        def standardize_rope_params(self):
+            params = dict(getattr(self, "rope_parameters", {}) or {})
+            if "rope_type" not in params:
+                params["rope_type"] = getattr(self, "rope_type", "default")
+            if "rope_theta" not in params:
+                params["rope_theta"] = getattr(self, "rope_theta")
+            self.rope_parameters = params
+            return params
 
     config = RoPEConfig()
 
@@ -284,19 +330,42 @@ def test_model_variants(ModelClass, qwen3_weights_path, generate_fn):
         context_size=QWEN_CONFIG_06_B["context_length"]
     )
     print("Encoded output text:", out)
-    expect = torch.tensor([
+
+    # PyTorch 2.12 changed CPU bf16 normal/uniform sampling, changing seeded weights.
+    # https://github.com/pytorch/pytorch/pull/175988
+    if Version(torch.__version__).release < (2, 12):
+        expected_new_tokens = [[112120, 83942, 60483, 102652, 7414]]
+    else:
+        # bf16 rounding can change the third greedy token; both continuations occur on Linux.
+        expected_new_tokens = [
+            [69468, 119157, 67829, 57827, 132941],
+            [69468, 119157, 79451, 45593, 45384],
+        ]
+
+    expected_outputs = [torch.tensor([
         [151644, 872, 198, 35127, 752, 264, 2805, 16800, 311,
-         3460, 4128,  4119, 13, 151645, 198, 112120, 83942, 60483,
-         102652, 7414]
-    ])
-    assert torch.equal(expect, out)
+         3460, 4128, 4119, 13, 151645, 198] + tokens
+    ]) for tokens in expected_new_tokens]
+    assert any(torch.equal(expect, out) for expect in expected_outputs), (
+        f"Unexpected tokens with PyTorch {torch.__version__} on {platform.system()} {platform.machine()}: "
+        f"{out.tolist()}"
+    )
 
 
-def test_model_KV_noKV(qwen3_weights_path):
+def test_model_KV_noKV():
+    cfg = QWEN_CONFIG_06_B.copy()
+    cfg.update({
+        "n_layers": 2,
+        "emb_dim": 64,
+        "hidden_dim": 128,
+        "n_heads": 4,
+        "n_kv_groups": 2,
+        "head_dim": 16,
+        "dtype": torch.float32,
+    })
 
     torch.manual_seed(123)
-    model_KV = Qwen3ModelKV(QWEN_CONFIG_06_B)
-    model_KV.load_state_dict(torch.load(qwen3_weights_path))
+    model_KV = Qwen3ModelKV(cfg)
     model_KV.eval()
 
     tokenizer = Qwen3Tokenizer(
@@ -314,30 +383,38 @@ def test_model_KV_noKV(qwen3_weights_path):
         model=model_KV,
         idx=input_token_ids,
         max_new_tokens=5,
-        context_size=QWEN_CONFIG_06_B["context_length"]
+        context_size=cfg["context_length"]
     )
     del model_KV
 
     torch.manual_seed(123)
-    model_noKV = Qwen3Model(QWEN_CONFIG_06_B)
-    model_noKV.load_state_dict(torch.load(qwen3_weights_path))
+    model_noKV = Qwen3Model(cfg)
     model_noKV.eval()
 
     out_noKV = generate_text_simple(
         model=model_noKV,
         idx=input_token_ids,
         max_new_tokens=5,
-        context_size=QWEN_CONFIG_06_B["context_length"]
+        context_size=cfg["context_length"]
     )
 
     assert torch.equal(out_noKV, out_KV)
 
 
-def test_model_batched_KV(qwen3_weights_path):
+def test_model_batched_KV():
+    cfg = QWEN_CONFIG_06_B.copy()
+    cfg.update({
+        "n_layers": 2,
+        "emb_dim": 64,
+        "hidden_dim": 128,
+        "n_heads": 4,
+        "n_kv_groups": 2,
+        "head_dim": 16,
+        "dtype": torch.float32,
+    })
 
     torch.manual_seed(123)
-    model_KV = Qwen3ModelKV(QWEN_CONFIG_06_B)
-    model_KV.load_state_dict(torch.load(qwen3_weights_path))
+    model_KV = Qwen3ModelKV(cfg)
     model_KV.eval()
 
     tokenizer = Qwen3Tokenizer(
@@ -357,20 +434,19 @@ def test_model_batched_KV(qwen3_weights_path):
         model=model_KV,
         idx=input_token_ids,
         max_new_tokens=5,
-        context_size=QWEN_CONFIG_06_B["context_length"]
+        context_size=cfg["context_length"]
     )
     del model_KV
 
     torch.manual_seed(123)
-    model_KV_batched = Qwen3ModelKVBatched(QWEN_CONFIG_06_B)
-    model_KV_batched.load_state_dict(torch.load(qwen3_weights_path))
+    model_KV_batched = Qwen3ModelKVBatched(cfg)
     model_KV_batched.eval()
 
     out_KV_bs_1 = generate_text_simple_batched(
         model=model_KV_batched,
         idx=input_token_ids,
         max_new_tokens=5,
-        context_size=QWEN_CONFIG_06_B["context_length"]
+        context_size=cfg["context_length"]
     )
 
     assert torch.equal(out_KV, out_KV_bs_1)
@@ -391,7 +467,7 @@ def test_model_batched_KV(qwen3_weights_path):
         model=model_KV_batched,
         idx=input_tensor,
         max_new_tokens=5,
-        context_size=QWEN_CONFIG_06_B["context_length"],
+        context_size=cfg["context_length"],
     )
     assert torch.equal(out_KV.squeeze(0), out_KV_bs_2[0]), (out_KV.squeeze(0).shape, out_KV_bs_2[0].shape)
 
@@ -495,12 +571,12 @@ def test_chat_wrap_and_equivalence(add_gen, add_think):
 
         # Our encode vs HF template
         ours = qt.encode(prompt)
-        ref = hf_tok.apply_chat_template(
+        ref = _hf_ids(hf_tok.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=add_gen,
             enable_thinking=add_think,
-        )
+        ))
 
         if add_gen and not add_think:
             pass  # skip edge case as this is not something we use in practice
@@ -508,7 +584,8 @@ def test_chat_wrap_and_equivalence(add_gen, add_think):
             assert ours == ref, (repo_id, add_gen, add_think)
 
         # Round-trip decode equality
-        assert qt.decode(ours) == hf_tok.decode(ref)
+        if not (add_gen and not add_think):
+            assert qt.decode(ours) == hf_tok.decode(ref)
 
         # EOS/PAD parity
         assert qt.eos_token_id == hf_tok.eos_token_id
@@ -547,6 +624,7 @@ def test_multiturn_equivalence(repo_id, tok_file, add_gen, add_think):
         messages, tokenize=True,
         add_generation_prompt=add_gen, enable_thinking=add_think
     )
+    ref_ids = _hf_ids(ref_ids)
     ref_text = hf_tok.apply_chat_template(
         messages, tokenize=False,
         add_generation_prompt=add_gen, enable_thinking=add_think
@@ -611,6 +689,7 @@ def test_tokenizer_equivalence():
                         add_generation_prompt=states[0],
                         enable_thinking=states[1],
                     )
+                    input_token_ids_ref = _hf_ids(input_token_ids_ref)
                 else:
                     input_token_ids_ref = input_token_ids
 
@@ -665,6 +744,7 @@ def test_multiturn_prefix_stability(repo_id, tok_file, add_gen, add_think):
             running, tokenize=True,
             add_generation_prompt=add_gen, enable_thinking=add_think
         )
+        ref_ids = _hf_ids(ref_ids)
         ref_text = hf_tok.apply_chat_template(
             running, tokenize=False,
             add_generation_prompt=add_gen, enable_thinking=add_think

@@ -301,14 +301,15 @@ def generate_text_simple_cached(model, idx, max_new_tokens,
             if use_cuda:
                 torch.cuda.synchronize()
 
-            for _ in range(max_new_tokens):
+            for step in range(max_new_tokens):
                 # a) pick the token with the highest log-probability (greedy sampling)
                 next_idx = logits[:, -1].argmax(dim=-1)
                 # b) append it to the running sequence (in-place)
                 generated[:, cur_len] = next_idx
                 cur_len += 1
                 # c) feed model only the new token
-                logits = model(generated[:, cur_len - 1 : cur_len], use_cache=True)
+                if step + 1 < max_new_tokens:  # Skips the forward pass after the last token is generated
+                    logits = model(generated[:, cur_len - 1 : cur_len], use_cache=True)
 
                 if use_cuda:
                     torch.cuda.synchronize()
@@ -341,7 +342,7 @@ def generate_text_simple_cached(model, idx, max_new_tokens,
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--emb_dim", type=int, default=768, help="Model embedding dimension.")
     parser.add_argument("--hidden_dim", type=int, default=768*4, help="Intermediate FFN size.")
     parser.add_argument("--n_heads", type=int, default=12, help="Number of attention heads.")
